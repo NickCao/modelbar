@@ -179,13 +179,23 @@ def manifests(name: str, reference: str):
     return Response(model.manifest_bytes, headers=headers)
 
 
-@app.route("/v2/<path:name>/blobs/<digest>", methods=["GET", "HEAD"])
-def blobs(name: str, digest: str):
-    entry = None
+def _find_blob(digest: str) -> BlobEntry | None:
     for model in _digest_to_model.values():
         if digest in model.blobs:
-            entry = model.blobs[digest]
-            break
+            return model.blobs[digest]
+    return None
+
+
+@app.route("/v2/<path:name>/blobs/<digest>", methods=["GET", "HEAD"])
+def blobs(name: str, digest: str):
+    entry = _find_blob(digest)
+
+    if not entry:
+        try:
+            resolve_and_cache(name, "main")
+        except Exception:
+            pass
+        entry = _find_blob(digest)
 
     if not entry:
         return Response("blob not found", status=404)
