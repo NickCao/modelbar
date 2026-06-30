@@ -6,6 +6,7 @@ from functools import lru_cache
 import httpx
 from flask import Flask, Response, redirect, request
 from huggingface_hub import HfApi, hf_hub_url
+from huggingface_hub.utils import build_hf_headers
 
 MEDIA_TYPE_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 MEDIA_TYPE_CONFIG = "application/vnd.oci.image.config.v1+json"
@@ -67,7 +68,8 @@ def resolve(repo: str, revision: str) -> ResolvedModel:
             )
         else:
             url = hf_hub_url(repo, f.path, revision=revision)
-            resp = httpx.get(url, follow_redirects=True)
+            headers = build_hf_headers()
+            resp = httpx.get(url, headers=headers, follow_redirects=True)
             resp.raise_for_status()
             data = resp.content
             digest = sha256_hex(data)
@@ -199,8 +201,10 @@ def blobs(name: str, digest: str):
             return Response(headers=headers)
         return Response(entry.data, headers=headers)
 
-    download_url = hf_hub_url(entry.repo, entry.filename, revision=entry.revision)
-    return redirect(download_url, code=307)
+    url = hf_hub_url(entry.repo, entry.filename, revision=entry.revision)
+    headers = build_hf_headers()
+    resp = httpx.head(url, headers=headers, follow_redirects=True)
+    return redirect(str(resp.url), code=307)
 
 
 def main():
