@@ -1,20 +1,17 @@
 import hashlib
 import json
+import tarfile
 from dataclasses import dataclass
 from functools import lru_cache
 
 import httpx
-from flask import Flask, Response, redirect, request
+from flask import Flask, Response, request, stream_with_context
 from huggingface_hub import HfApi, hf_hub_url
 from huggingface_hub.utils import build_hf_headers
 
 MEDIA_TYPE_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
-MEDIA_TYPE_EMPTY_CONFIG = "application/vnd.oci.empty.v1+json"
-MEDIA_TYPE_LAYER = "application/octet-stream"
-ARTIFACT_TYPE = "application/vnd.modelbar.model.v1"
-
-EMPTY_CONFIG = b"{}"
-EMPTY_CONFIG_DIGEST = f"sha256:{hashlib.sha256(EMPTY_CONFIG).hexdigest()}"
+MEDIA_TYPE_CONFIG = "application/vnd.oci.image.config.v1+json"
+MEDIA_TYPE_LAYER = "application/vnd.oci.image.layer.v1.tar"
 
 SKIP_FILES = {".gitattributes", "README.md", "LICENSE", "LICENSE.txt", "LICENSE.md", "NOTICE"}
 
@@ -28,15 +25,42 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def tar_header(filename: str, size: int) -> bytes:
+    info = tarfile.TarInfo(name=filename)
+    info.size = size
+    info.mtime = 0
+    info.mode = 0o644
+    info.type = tarfile.REGTYPE
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    return info.tobuf(tarfile.GNU_FORMAT)
+
+
+def tar_padding(size: int) -> bytes:
+    remainder = size % 512
+    pad = b"\0" * (512 - remainder) if remainder else b""
+    return pad + b"\0" * 1024
+
+
+def tar_total_size(file_size: int) -> int:
+    remainder = file_size % 512
+    padding = (512 - remainder) if remainder else 0
+    return 512 + file_size + padding + 1024
+
+
 @dataclass
 class BlobEntry:
     digest: str
+    tar_size: int
     filename: str
-    size: int
+    raw_size: int
     repo: str
     revision: str
     is_lfs: bool
     data: bytes | None = None
+    is_config: bool = False
 
 
 @dataclass
@@ -46,12 +70,32 @@ class ResolvedModel:
     blobs: dict[str, BlobEntry]
 
 
+def _compute_tar_digest(repo: str, revision: str, filename: str, raw_size: int) -> str:
+    """Stream a file from HF to compute the sha256 of its TAR-wrapped form."""
+    header = tar_header(filename, raw_size)
+    pad = tar_padding(raw_size)
+
+    h = hashlib.sha256()
+    h.update(header)
+
+    url = hf_hub_url(repo, filename, revision=revision)
+    headers = build_hf_headers()
+    with httpx.stream("GET", url, headers=headers, follow_redirects=True) as resp:
+        resp.raise_for_status()
+        for chunk in resp.iter_bytes(chunk_size=1024 * 1024):
+            h.update(chunk)
+
+    h.update(pad)
+    return h.hexdigest()
+
+
 @lru_cache(maxsize=128)
 def resolve(repo: str, revision: str) -> ResolvedModel:
     files = list(api.list_repo_tree(repo, revision=revision, recursive=True, repo_type="model"))
 
     blobs: dict[str, BlobEntry] = {}
     layers = []
+    diff_ids = []
 
     for f in files:
         if not hasattr(f, "size") or f.path in SKIP_FILES:
@@ -60,10 +104,13 @@ def resolve(repo: str, revision: str) -> ResolvedModel:
             continue
 
         if f.lfs:
+            raw_size = f.lfs.size
+            digest = _compute_tar_digest(repo, revision, f.path, raw_size)
             entry = BlobEntry(
-                digest=f"sha256:{f.lfs.sha256}",
+                digest=f"sha256:{digest}",
+                tar_size=tar_total_size(raw_size),
                 filename=f.path,
-                size=f.lfs.size,
+                raw_size=raw_size,
                 repo=repo,
                 revision=revision,
                 is_lfs=True,
@@ -73,55 +120,73 @@ def resolve(repo: str, revision: str) -> ResolvedModel:
             headers = build_hf_headers()
             resp = httpx.get(url, headers=headers, follow_redirects=True)
             resp.raise_for_status()
-            data = resp.content
-            digest = sha256_hex(data)
+            raw_data = resp.content
+
+            header = tar_header(f.path, len(raw_data))
+            pad = tar_padding(len(raw_data))
+            tar_data = header + raw_data + pad
+            digest = sha256_hex(tar_data)
+
             entry = BlobEntry(
                 digest=f"sha256:{digest}",
+                tar_size=len(tar_data),
                 filename=f.path,
-                size=len(data),
+                raw_size=len(raw_data),
                 repo=repo,
                 revision=revision,
                 is_lfs=False,
-                data=data,
+                data=tar_data,
             )
 
         blobs[entry.digest] = entry
         layers.append(
             {
                 "mediaType": MEDIA_TYPE_LAYER,
-                "size": entry.size,
+                "size": entry.tar_size,
                 "digest": entry.digest,
                 "annotations": {"org.opencontainers.image.title": entry.filename},
             }
         )
+        diff_ids.append(entry.digest)
 
     if not layers:
         raise ValueError(f"no model files found in {repo}@{revision}")
 
-    blobs[EMPTY_CONFIG_DIGEST] = BlobEntry(
-        digest=EMPTY_CONFIG_DIGEST,
+    config = {
+        "architecture": "amd64",
+        "os": "linux",
+        "config": {
+            "Labels": {
+                "org.huggingface.repo": repo,
+                "org.huggingface.revision": revision,
+            }
+        },
+        "rootfs": {"type": "layers", "diff_ids": diff_ids},
+    }
+    config_bytes = json.dumps(config, separators=(",", ":")).encode()
+    config_digest = f"sha256:{sha256_hex(config_bytes)}"
+
+    blobs[config_digest] = BlobEntry(
+        digest=config_digest,
+        tar_size=len(config_bytes),
         filename="",
-        size=len(EMPTY_CONFIG),
+        raw_size=len(config_bytes),
         repo=repo,
         revision=revision,
         is_lfs=False,
-        data=EMPTY_CONFIG,
+        data=config_bytes,
+        is_config=True,
     )
 
     manifest = {
         "schemaVersion": 2,
         "mediaType": MEDIA_TYPE_MANIFEST,
-        "artifactType": ARTIFACT_TYPE,
         "config": {
-            "mediaType": MEDIA_TYPE_EMPTY_CONFIG,
-            "size": len(EMPTY_CONFIG),
-            "digest": EMPTY_CONFIG_DIGEST,
+            "mediaType": MEDIA_TYPE_CONFIG,
+            "size": len(config_bytes),
+            "digest": config_digest,
         },
         "layers": layers,
-        "annotations": {
-            "org.huggingface.repo": repo,
-            "org.huggingface.revision": revision,
-        },
     }
     manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode()
     manifest_digest = f"sha256:{sha256_hex(manifest_bytes)}"
@@ -177,6 +242,22 @@ def _find_blob(digest: str) -> BlobEntry | None:
     return None
 
 
+def _stream_tar_blob(entry: BlobEntry):
+    header = tar_header(entry.filename, entry.raw_size)
+    pad = tar_padding(entry.raw_size)
+
+    yield header
+
+    url = hf_hub_url(entry.repo, entry.filename, revision=entry.revision)
+    headers = build_hf_headers()
+    with httpx.stream("GET", url, headers=headers, follow_redirects=True) as resp:
+        resp.raise_for_status()
+        for chunk in resp.iter_bytes(chunk_size=1024 * 1024):
+            yield chunk
+
+    yield pad
+
+
 @app.route("/v2/<path:name>/blobs/<digest>", methods=["GET", "HEAD"])
 def blobs(name: str, digest: str):
     entry = _find_blob(digest)
@@ -191,20 +272,23 @@ def blobs(name: str, digest: str):
     if not entry:
         return Response("blob not found", status=404)
 
-    if entry.data is not None:
-        headers = {
-            "Content-Type": MEDIA_TYPE_LAYER,
-            "Docker-Content-Digest": digest,
-            "Content-Length": str(len(entry.data)),
-        }
-        if request.method == "HEAD":
-            return Response(headers=headers)
-        return Response(entry.data, headers=headers)
+    ct = MEDIA_TYPE_CONFIG if entry.is_config else MEDIA_TYPE_LAYER
+    resp_headers = {
+        "Content-Type": ct,
+        "Docker-Content-Digest": digest,
+        "Content-Length": str(entry.tar_size),
+    }
 
-    url = hf_hub_url(entry.repo, entry.filename, revision=entry.revision)
-    headers = build_hf_headers()
-    resp = httpx.head(url, headers=headers, follow_redirects=True)
-    return redirect(str(resp.url), code=307)
+    if request.method == "HEAD":
+        return Response(headers=resp_headers)
+
+    if entry.data is not None:
+        return Response(entry.data, headers=resp_headers)
+
+    return Response(
+        stream_with_context(_stream_tar_blob(entry)),
+        headers=resp_headers,
+    )
 
 
 def main():
