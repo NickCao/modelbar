@@ -9,8 +9,12 @@ from huggingface_hub import HfApi, hf_hub_url
 from huggingface_hub.utils import build_hf_headers
 
 MEDIA_TYPE_MANIFEST = "application/vnd.oci.image.manifest.v1+json"
-MEDIA_TYPE_CONFIG = "application/vnd.oci.image.config.v1+json"
-MEDIA_TYPE_LAYER = "application/vnd.oci.image.layer.v1.tar"
+MEDIA_TYPE_EMPTY_CONFIG = "application/vnd.oci.empty.v1+json"
+MEDIA_TYPE_LAYER = "application/octet-stream"
+ARTIFACT_TYPE = "application/vnd.modelbar.model.v1"
+
+EMPTY_CONFIG = b"{}"
+EMPTY_CONFIG_DIGEST = f"sha256:{hashlib.sha256(EMPTY_CONFIG).hexdigest()}"
 
 SKIP_FILES = {".gitattributes", "README.md", "LICENSE", "LICENSE.txt", "LICENSE.md", "NOTICE"}
 
@@ -33,7 +37,6 @@ class BlobEntry:
     revision: str
     is_lfs: bool
     data: bytes | None = None
-    is_config: bool = False
 
 
 @dataclass
@@ -49,7 +52,6 @@ def resolve(repo: str, revision: str) -> ResolvedModel:
 
     blobs: dict[str, BlobEntry] = {}
     layers = []
-    diff_ids = []
 
     for f in files:
         if not hasattr(f, "size") or f.path in SKIP_FILES:
@@ -92,45 +94,34 @@ def resolve(repo: str, revision: str) -> ResolvedModel:
                 "annotations": {"org.opencontainers.image.title": entry.filename},
             }
         )
-        diff_ids.append(entry.digest)
 
     if not layers:
         raise ValueError(f"no model files found in {repo}@{revision}")
 
-    config = {
-        "architecture": "amd64",
-        "os": "linux",
-        "config": {
-            "Labels": {
-                "org.huggingface.repo": repo,
-                "org.huggingface.revision": revision,
-            }
-        },
-        "rootfs": {"type": "layers", "diff_ids": diff_ids},
-    }
-    config_bytes = json.dumps(config, separators=(",", ":")).encode()
-    config_digest = f"sha256:{sha256_hex(config_bytes)}"
-
-    blobs[config_digest] = BlobEntry(
-        digest=config_digest,
+    blobs[EMPTY_CONFIG_DIGEST] = BlobEntry(
+        digest=EMPTY_CONFIG_DIGEST,
         filename="",
-        size=len(config_bytes),
+        size=len(EMPTY_CONFIG),
         repo=repo,
         revision=revision,
         is_lfs=False,
-        data=config_bytes,
-        is_config=True,
+        data=EMPTY_CONFIG,
     )
 
     manifest = {
         "schemaVersion": 2,
         "mediaType": MEDIA_TYPE_MANIFEST,
+        "artifactType": ARTIFACT_TYPE,
         "config": {
-            "mediaType": MEDIA_TYPE_CONFIG,
-            "size": len(config_bytes),
-            "digest": config_digest,
+            "mediaType": MEDIA_TYPE_EMPTY_CONFIG,
+            "size": len(EMPTY_CONFIG),
+            "digest": EMPTY_CONFIG_DIGEST,
         },
         "layers": layers,
+        "annotations": {
+            "org.huggingface.repo": repo,
+            "org.huggingface.revision": revision,
+        },
     }
     manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode()
     manifest_digest = f"sha256:{sha256_hex(manifest_bytes)}"
@@ -201,9 +192,8 @@ def blobs(name: str, digest: str):
         return Response("blob not found", status=404)
 
     if entry.data is not None:
-        ct = MEDIA_TYPE_CONFIG if entry.is_config else MEDIA_TYPE_LAYER
         headers = {
-            "Content-Type": ct,
+            "Content-Type": MEDIA_TYPE_LAYER,
             "Docker-Content-Digest": digest,
             "Content-Length": str(len(entry.data)),
         }
